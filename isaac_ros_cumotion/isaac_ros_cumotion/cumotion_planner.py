@@ -612,6 +612,16 @@ class CumotionActionServer(Node):
                     + '" do not match'
                 )
                 result.error_code.val = MoveItErrorCodes.INVALID_LINK_NAME
+
+                # detach object from end effector:
+                for obj in scene.robot_state.attached_collision_objects:
+                    _, supported_objects = self.get_cumotion_collision_object(obj.object)
+                    if supported_objects:
+                        self.motion_gen.detach_object_from_robot(
+                            link_name=obj.link_name
+                        )
+                        break
+
                 return result
             if position_link_name != plan_link_name:
                 self.get_logger().error(
@@ -623,6 +633,16 @@ class CumotionActionServer(Node):
                     + position_link_name
                 )
                 result.error_code.val = MoveItErrorCodes.INVALID_LINK_NAME
+
+                # detach object from end effector:
+                for obj in scene.robot_state.attached_collision_objects:
+                    _, supported_objects = self.get_cumotion_collision_object(obj.object)
+                    if supported_objects:
+                        self.motion_gen.detach_object_from_robot(
+                            link_name=obj.link_name
+                        )
+                        break
+
                 return result
         else:
             self.get_logger().error('Goal constraints not supported')
@@ -631,7 +651,7 @@ class CumotionActionServer(Node):
         motion_gen_result = self.motion_gen.plan_single(
             start_state,
             goal_pose,
-            MotionGenPlanConfig(max_attempts=5, enable_graph_attempt=1,
+            MotionGenPlanConfig(max_attempts=1, enable_graph_attempt=1,
                                 time_dilation_factor=time_dilation_factor),
         )
 
