@@ -7,38 +7,29 @@
 # without an express license agreement from NVIDIA CORPORATION or
 # its affiliates is strictly prohibited.
 
-from os import path
 import time
+from os import path
 
+import numpy as np
+import rclpy
+import torch
 from ament_index_python.packages import get_package_share_directory
 from curobo.geom.sdf.world import CollisionCheckerType
-from curobo.geom.types import Cuboid
-from curobo.geom.types import Cylinder
-from curobo.geom.types import Mesh
-from curobo.geom.types import Sphere
+from curobo.geom.types import Cuboid, Cylinder, Mesh, Sphere
 from curobo.geom.types import VoxelGrid as CuVoxelGrid
 from curobo.geom.types import WorldConfig
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.types.state import JointState as CuJointState
 from curobo.util.logger import setup_curobo_logger
-from curobo.util_file import get_robot_configs_path
-from curobo.util_file import join_path
-from curobo.util_file import load_yaml
-from curobo.wrap.reacher.motion_gen import MotionGen
-from curobo.wrap.reacher.motion_gen import MotionGenConfig
-from curobo.wrap.reacher.motion_gen import MotionGenPlanConfig
-from curobo.wrap.reacher.motion_gen import MotionGenStatus
-from geometry_msgs.msg import Point
-from geometry_msgs.msg import Vector3
-from isaac_ros_cumotion.xrdf_utils import convert_xrdf_to_curobo
+from curobo.util_file import get_robot_configs_path, join_path, load_yaml
+from curobo.wrap.reacher.motion_gen import (MotionGen, MotionGenConfig,
+                                            MotionGenPlanConfig,
+                                            MotionGenStatus)
+from geometry_msgs.msg import Point, Vector3
 from moveit_msgs.action import MoveGroup
-from moveit_msgs.msg import CollisionObject
-from moveit_msgs.msg import MoveItErrorCodes
-from moveit_msgs.msg import RobotTrajectory
-import numpy as np
+from moveit_msgs.msg import CollisionObject, MoveItErrorCodes, RobotTrajectory
 from nvblox_msgs.srv import EsdfAndGradients
-import rclpy
 from rclpy.action import ActionServer
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
@@ -46,10 +37,10 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 from shape_msgs.msg import SolidPrimitive
 from std_msgs.msg import ColorRGBA
-import torch
-from trajectory_msgs.msg import JointTrajectory
-from trajectory_msgs.msg import JointTrajectoryPoint
-from visualization_msgs.msg import Marker
+from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+from visualization_msgs.msg import Marker, MarkerArray
+
+from isaac_ros_cumotion.xrdf_utils import convert_xrdf_to_curobo
 
 
 class CumotionActionServer(Node):
@@ -71,6 +62,7 @@ class CumotionActionServer(Node):
         self.declare_parameter('max_publish_voxels', 50000)
         self.declare_parameter('joint_states_topic', '/joint_states')
         self.declare_parameter('tool_frame', rclpy.Parameter.Type.STRING)
+        self.declare_parameter('publish_robot_as_spheres', False)
 
         self.declare_parameter('grid_position', [0.0, 0.0, 0.0])
 
@@ -90,6 +82,11 @@ class CumotionActionServer(Node):
         self._action_server = ActionServer(
             self, MoveGroup, 'cumotion/move_group', self.execute_callback
         )
+
+        self._publish_robot_as_spheres = self.get_parameter('publish_robot_as_spheres')
+        if self._publish_robot_as_spheres:
+            self.__initial_spheres_pub = self.create_publisher(MarkerArray, '/curobo/initial_robot_spheres', 10)
+            self.__final_spheres_pub = self.create_publisher(MarkerArray, '/curobo/final_robot_spheres', 10)
 
         try:
             self.__urdf_path = self.get_parameter('urdf_path')
@@ -548,16 +545,21 @@ class CumotionActionServer(Node):
                 start_state = current_joint_state
 
         # attach object to end effector:
+        # NOTE: It is assumed that all collision objects are attached to the same link (ex: ee_link)
+        external_objects = []
         for obj in scene.robot_state.attached_collision_objects:
             cumotion_objects, supported_objects = self.get_cumotion_collision_object(obj.object)
             if supported_objects:
+                external_objects.append(cumotion_objects[0])
+                link_name = obj.link_name
                 ee_pose = self.motion_gen.compute_kinematics(start_state).ee_pose
-                self.motion_gen.attach_external_objects_to_robot(
-                    start_state,
-                    cumotion_objects,
-                    link_name=obj.link_name,
-                    world_objects_pose_offset=ee_pose,
-                )
+        self.motion_gen.attach_external_objects_to_robot(
+            joint_state=start_state,
+            external_objects=external_objects,
+            surface_sphere_radius=0.01,
+            link_name=link_name,
+            world_objects_pose_offset=ee_pose,
+        )
 
         if len(plan_req.goal_constraints[0].joint_constraints) > 0:
             self.get_logger().info('Calculating goal pose from Joint target')
@@ -642,6 +644,70 @@ class CumotionActionServer(Node):
             )
             result.planning_time = motion_gen_result.total_time
             result.planned_trajectory = traj
+
+            # publish collision spheres for initial and final joint positions:
+            if self._publish_robot_as_spheres:
+                # initial pose (color: yellow)
+                initial_joint_position = self.tensor_args.to_device(traj.joint_trajectory.points[0].positions).view(1, -1)
+                sph_list = self.motion_gen.kinematics.get_robot_as_spheres(initial_joint_position)
+                if len(sph_list) != 0:
+                    markers = MarkerArray()
+                    for si, s in enumerate(sph_list[0]):
+                        if not np.any(np.isnan(s.position)):
+                            marker = Marker()
+                            marker.header.frame_id = self.__robot_base_frame
+                            marker.header.stamp = self.get_clock().now().to_msg()
+                            marker.type = Marker.SPHERE
+                            marker.id = 10000 + si
+                            marker.action = Marker.ADD
+                            marker.pose.position.x = float(s.position[0])
+                            marker.pose.position.y = float(s.position[1])
+                            marker.pose.position.z = float(s.position[2])
+                            marker.pose.orientation.w = 1.0
+                            marker.pose.orientation.x = 0.0
+                            marker.pose.orientation.y = 0.0
+                            marker.pose.orientation.z = 0.0
+                            marker.color.r = 1.0
+                            marker.color.g = 1.0
+                            marker.color.b = 0.0
+                            marker.color.a = 0.5
+                            marker.scale.x = float(s.radius) * 2
+                            marker.scale.y = float(s.radius) * 2
+                            marker.scale.z = float(s.radius) * 2
+                            marker.lifetime = rclpy.duration.Duration(seconds=0.0).to_msg() # forever
+                            markers.markers.append(marker)
+                    self.__initial_spheres_pub.publish(markers)
+                # final pose (color: cyan)
+                final_joint_position = self.tensor_args.to_device(traj.joint_trajectory.points[-1].positions).view(1, -1)
+                sph_list = self.motion_gen.kinematics.get_robot_as_spheres(final_joint_position)
+                if len(sph_list) != 0:
+                    markers = MarkerArray()
+                    for si, s in enumerate(sph_list[0]):
+                        if not np.any(np.isnan(s.position)):
+                            marker = Marker()
+                            marker.header.frame_id = self.__robot_base_frame
+                            marker.header.stamp = self.get_clock().now().to_msg()
+                            marker.type = Marker.SPHERE
+                            marker.id = 10000 + si
+                            marker.action = Marker.ADD
+                            marker.pose.position.x = float(s.position[0])
+                            marker.pose.position.y = float(s.position[1])
+                            marker.pose.position.z = float(s.position[2])
+                            marker.pose.orientation.w = 1.0
+                            marker.pose.orientation.x = 0.0
+                            marker.pose.orientation.y = 0.0
+                            marker.pose.orientation.z = 0.0
+                            marker.color.r = 0.0
+                            marker.color.g = 1.0
+                            marker.color.b = 1.0
+                            marker.color.a = 0.5
+                            marker.scale.x = float(s.radius) * 2
+                            marker.scale.y = float(s.radius) * 2
+                            marker.scale.z = float(s.radius) * 2
+                            marker.lifetime = rclpy.duration.Duration(seconds=0.0).to_msg() # forever
+                            markers.markers.append(marker)
+                    self.__final_spheres_pub.publish(markers)
+
         elif not motion_gen_result.valid_query:
             self.get_logger().error(
                 f'Invalid planning query: {motion_gen_result.status}'
@@ -670,6 +736,15 @@ class CumotionActionServer(Node):
             + str(motion_gen_result.status)
         )
         self.__query_count += 1
+
+        # detach object from end effector:
+        for obj in scene.robot_state.attached_collision_objects:
+            _, supported_objects = self.get_cumotion_collision_object(obj.object)
+            if supported_objects:
+                self.motion_gen.detach_object_from_robot(
+                    link_name=obj.link_name
+                )
+                break
         return result
 
     def publish_voxels(self, voxels):
