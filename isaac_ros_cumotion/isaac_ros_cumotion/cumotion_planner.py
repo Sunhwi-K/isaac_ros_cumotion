@@ -83,7 +83,7 @@ class CumotionActionServer(Node):
             self, MoveGroup, 'cumotion/move_group', self.execute_callback
         )
 
-        self._publish_robot_as_spheres = self.get_parameter('publish_robot_as_spheres')
+        self._publish_robot_as_spheres = self.get_parameter('publish_robot_as_spheres').get_parameter_value().bool_value
         if self._publish_robot_as_spheres:
             self.__initial_spheres_pub = self.create_publisher(MarkerArray, '/curobo/initial_robot_spheres', 10)
             self.__final_spheres_pub = self.create_publisher(MarkerArray, '/curobo/final_robot_spheres', 10)
