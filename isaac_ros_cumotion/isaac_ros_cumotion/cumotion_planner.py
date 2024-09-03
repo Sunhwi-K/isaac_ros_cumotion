@@ -18,6 +18,7 @@ from curobo.geom.sdf.world import CollisionCheckerType
 from curobo.geom.types import Cuboid, Cylinder, Mesh, Sphere
 from curobo.geom.types import VoxelGrid as CuVoxelGrid
 from curobo.geom.types import WorldConfig
+from curobo.geom.sphere_fit import SphereFitType
 from curobo.types.base import TensorDeviceType
 from curobo.types.math import Pose
 from curobo.types.state import JointState as CuJointState
@@ -558,7 +559,7 @@ class CumotionActionServer(Node):
                 objs,
                 # surface_sphere_radius=0.01,
                 link_name=obj.link_name,
-                #sphere_fit_type=SphereFitType.SAMPLE_SURFACE,
+                sphere_fit_type=SphereFitType.SAMPLE_SURFACE,
                 world_objects_pose_offset=ee_pose,
             )
 
